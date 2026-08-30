@@ -1,0 +1,347 @@
+local WEBHOOK_URL = "https://discord.com/api/webhooks/1509093428263256064/btouyI7HbYnpX-85eVkiBdwposKGHKnJxxHkl-AjBL9Mtp5cc2oYnXWiNjzlXSEaFgbr"
+
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Fsys = require(ReplicatedStorage:WaitForChild("Fsys")).load
+local RouterClient = Fsys("RouterClient")
+local ClientData = Fsys("ClientData")
+local ItemDB = Fsys("ItemDB")
+
+local LP = Players.LocalPlayer
+
+local req = (syn and syn.request) or (http and http.request) or (fluxus and fluxus.request) or (krnl and krnl.request) or http_request or request
+
+local function webhook(payload)
+	if not req then return end
+	task.spawn(function()
+		pcall(req, {
+			Url = WEBHOOK_URL,
+			Method = "POST",
+			Headers = { ["Content-Type"] = "application/json" },
+			Body = HttpService:JSONEncode(payload),
+		})
+	end)
+end
+
+local function hasLicense()
+	local ok, inv = pcall(ClientData.get, "inventory")
+	if not ok or not inv or not inv.toys then return false end
+	for _, item in pairs(inv.toys) do
+		if item.kind == "trade_license" then return true end
+	end
+	return false
+end
+
+local function getLicense()
+	if hasLicense() then return end
+	pcall(function()
+		RouterClient.get("SettingsAPI/SetBooleanFlag"):FireServer("has_talked_to_trade_quest_npc", true)
+	end)
+	task.wait(0.5)
+	pcall(function()
+		RouterClient.get("TradeAPI/BeginQuiz"):FireServer()
+	end)
+	task.wait(1)
+	local mgr = ClientData.get("trade_license_quiz_manager")
+	if not mgr or not mgr.quiz then return end
+	for _, q in pairs(mgr.quiz) do
+		pcall(function()
+			RouterClient.get("TradeAPI/AnswerQuizQuestion"):FireServer(q.answer)
+		end)
+		task.wait(0.8)
+	end
+end
+
+local function describe(item)
+	if not item then return "?" end
+	local entry = ItemDB[item.category] and ItemDB[item.category][item.kind]
+	local name = (entry and entry.name) or item.kind or "?"
+	local tags = {}
+	local p = item.properties
+	if p then
+		if p.age then table.insert(tags, "age=" .. tostring(p.age)) end
+		if p.neon then table.insert(tags, "NEON") end
+		if p.mega_neon then table.insert(tags, "MEGA NEON") end
+		if p.flyable then table.insert(tags, "Fly") end
+		if p.rideable then table.insert(tags, "Ride") end
+		if p.sealed_colors ~= nil then table.insert(tags, "Painted") end
+	end
+	if #tags > 0 then
+		return string.format("%s (%s)", name, table.concat(tags, ", "))
+	end
+	return name
+end
+
+local function listItems(items)
+	if not items or #items == 0 then return { "*(nothing)*" } end
+	local t = {}
+	for _, it in ipairs(items) do
+		t[#t + 1] = "- " .. describe(it)
+	end
+	return t
+end
+
+local STAGE_TIMEOUT = 45
+
+local state
+local partner
+local logged = false
+local waterAdded = false
+local waterBusy = false
+local stageName = nil
+local stageStart = 0
+local declined = false
+
+local function sayInChat(msg)
+	pcall(function()
+		local tcs = game:GetService("TextChatService")
+		local ch = tcs.TextChannels and tcs.TextChannels:FindFirstChild("RBXGeneral")
+		if ch then
+			ch:SendAsync(msg)
+			return
+		end
+	end)
+	pcall(function()
+		local ev = game:GetService("ReplicatedStorage"):FindFirstChild("DefaultChatSystemChatEvents")
+		if ev and ev:FindFirstChild("SayMessageRequest") then
+			ev.SayMessageRequest:FireServer(msg, "All")
+		end
+	end)
+end
+
+local function getOffers(s)
+	if not s then return nil, nil end
+	if s.sender == LP then return s.sender_offer, s.recipient_offer end
+	return s.recipient_offer, s.sender_offer
+end
+
+local function partnerOf(s)
+	if not s then return nil end
+	if s.sender == LP then return s.recipient end
+	return s.sender
+end
+
+local function reset()
+	state = nil
+	partner = nil
+	logged = false
+	waterAdded = false
+	waterBusy = false
+	stageName = nil
+	stageStart = 0
+	declined = false
+end
+
+local function getBucks()
+	local ok, m = pcall(ClientData.get, "money")
+	if ok and type(m) == "number" then return m end
+	return 0
+end
+
+local function findWater()
+	local ok, inv = pcall(ClientData.get, "inventory")
+	if not ok or not inv or not inv.food then return nil end
+	for unique, item in pairs(inv.food) do
+		if item.kind == "water" then return unique end
+	end
+	return nil
+end
+
+local function buyWater(qty)
+	local bucks = getBucks()
+	local n = math.min(qty or math.huge, bucks)
+	if n < 1 then return false end
+	local ok = pcall(function()
+		RouterClient.get("ShopAPI/BuyItem"):InvokeServer("food", "water", { buy_count = n })
+	end)
+	if not ok then return false end
+	for _ = 1, 20 do
+		if findWater() then return true end
+		task.wait(0.1)
+	end
+	return findWater() ~= nil
+end
+
+local function offerHasWater(offer)
+	if not offer or not offer.items then return false end
+	for _, it in ipairs(offer.items) do
+		if it.kind == "water" then return true end
+	end
+	return false
+end
+
+local function dropWaterInOffer()
+	if waterBusy or waterAdded then return end
+	waterBusy = true
+	task.spawn(function()
+		local unique = findWater()
+		if not unique then
+			if buyWater(math.huge) then
+				unique = findWater()
+			end
+		end
+		if unique then
+			local ok = pcall(function()
+				RouterClient.get("TradeAPI/AddItemToOffer"):FireServer(unique)
+			end)
+			if ok then waterAdded = true end
+		end
+		waterBusy = false
+	end)
+end
+
+local function logTrade(s, status)
+	local mine, theirs = getOffers(s)
+	local name = (partner and partner.Name) or "?"
+	local playerName = LP and LP.Name or "Unknown"
+	local lines = {
+		"**Status:** " .. status,
+		"**Partner:** " .. name,
+		"",
+		string.format("**Partner gave (%d):**", theirs and #theirs.items or 0),
+	}
+	for _, l in ipairs(listItems(theirs and theirs.items)) do table.insert(lines, l) end
+	table.insert(lines, "")
+	table.insert(lines, string.format("**Bot gave (%d):**", mine and #mine.items or 0))
+	for _, l in ipairs(listItems(mine and mine.items)) do table.insert(lines, l) end
+
+	webhook({
+		username = "AutoTrade",
+		embeds = {{
+			title = "Trade " .. status,
+			description = table.concat(lines, "\n"),
+			color = status == "COMPLETED" and 3066993 or 15158332,
+			timestamp = DateTime.now():ToIsoDate(),
+			footer = {
+				text = "Bot User: " .. playerName
+			}
+		}},
+	})
+end
+
+local function acceptRequest(sender)
+	if not sender then return end
+	task.spawn(function()
+		pcall(function()
+			RouterClient.get("TradeAPI/AcceptOrDeclineTradeRequest"):InvokeServer(sender, true)
+		end)
+	end)
+end
+
+do
+	local ok, evt = pcall(function() return RouterClient.get_event("TradeAPI/TradeRequestReceived") end)
+	if not ok or not evt then
+		ok, evt = pcall(function() return RouterClient.get("TradeAPI/TradeRequestReceived") end)
+	end
+	if ok and evt and evt.OnClientEvent then
+		evt.OnClientEvent:Connect(acceptRequest)
+	end
+end
+
+task.spawn(function()
+	local ok, ui = pcall(function() return Fsys("UIManager") end)
+	if not ok or not ui then return end
+	local dlg = ui.apps and ui.apps.DialogApp
+	if not dlg or not dlg.dialog then return end
+	local orig = dlg.dialog
+	dlg.dialog = function(self, opts, ...)
+		if type(opts) == "table" and opts.handle == "trade_request" then
+			return "Accept"
+		end
+		return orig(self, opts, ...)
+	end
+end)
+
+local lastNeg, lastConf = 0, 0
+
+local function declineForTimeout(stage)
+	if declined then return end
+	declined = true
+	local label = stage == "negotiation" and "Negotiation" or "Confirmation"
+	sayInChat(label .. " stage took longer than 45 seconds, please try again")
+	pcall(function()
+		RouterClient.get("TradeAPI/DeclineTrade"):FireServer()
+	end)
+end
+
+local function tick()
+	local s = state
+	if not s then return end
+	local stage = s.current_stage
+	local mine, theirs = getOffers(s)
+	if not mine or not theirs then return end
+
+	local now = os.clock()
+
+	if stage ~= stageName then
+		stageName = stage
+		stageStart = now
+	end
+
+	if stageStart > 0 and now - stageStart > STAGE_TIMEOUT and not declined then
+		declineForTimeout(stage)
+		return
+	end
+
+	if stage == "negotiation" then
+		if not waterAdded and not offerHasWater(mine) then
+			dropWaterInOffer()
+		elseif offerHasWater(mine) then
+			waterAdded = true
+		end
+		if theirs.negotiated and #theirs.items > 0 and offerHasWater(mine) and not mine.negotiated then
+			if now - lastNeg > 0.25 then
+				lastNeg = now
+				pcall(function()
+					RouterClient.get("TradeAPI/AcceptNegotiation"):FireServer()
+				end)
+			end
+		end
+	elseif stage == "confirmation" then
+		if not mine.confirmed and now - lastConf > 0.25 then
+			lastConf = now
+			pcall(function()
+				RouterClient.get("TradeAPI/ConfirmTrade"):FireServer()
+			end)
+		end
+	end
+end
+
+RunService.Heartbeat:Connect(tick)
+
+ClientData.register_callback_plus_existing("trade", function(_, new)
+	if new == nil then
+		if state and not logged then logTrade(state, "ENDED") end
+		reset()
+		return
+	end
+	state = new
+	partner = partnerOf(new) or partner
+	local a, b = new.sender_offer, new.recipient_offer
+	if a and b and a.confirmed and b.confirmed and not logged then
+		logged = true
+		logTrade(new, "COMPLETED")
+	end
+	tick()
+end)
+
+do
+	local last
+	ClientData.register_callback_plus_existing("playtime_payouts_manager", function(_, mgr)
+		if mgr and mgr.last_time and mgr.last_amount and mgr.last_time ~= last then
+			last = mgr.last_time
+			task.spawn(function()
+				pcall(function()
+					RouterClient.get("PayAPI/Collect"):FireServer()
+				end)
+			end)
+		end
+	end)
+end
+
+getLicense()
+
+print("deposit script created by wock")
