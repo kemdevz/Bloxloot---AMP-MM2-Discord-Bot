@@ -1,0 +1,270 @@
+local Player = game:GetService("Players").LocalPlayer
+local PlayerGui = Player:WaitForChild("PlayerGui")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local canFire = true
+local DEBOUNCE_TIME = 1
+local lastOfferID = nil
+local tradeCompleted = false
+local webhookSent = false
+local otherPlayerAccepted = false
+
+local function getTradeRequest()
+    local mainGUI = PlayerGui:FindFirstChild("MainGUI")
+    if not mainGUI then return nil end
+    local gameFrame = mainGUI:FindFirstChild("Game")
+    if not gameFrame then return nil end
+    local leaderboard = gameFrame:FindFirstChild("Leaderboard")
+    if not leaderboard then return nil end
+    local container = leaderboard:FindFirstChild("Container")
+    if not container then return nil end
+    return container:FindFirstChild("TradeRequest")
+end
+
+local function getTradeGUI()
+    return PlayerGui:FindFirstChild("TradeGUI")
+end
+
+local function getAcceptedElement()
+    local tradeGUI = getTradeGUI()
+    if not tradeGUI then return nil end
+    local container = tradeGUI:FindFirstChild("Container")
+    if not container then return nil end
+    local trade = container:FindFirstChild("Trade")
+    if not trade then return nil end
+    local theirOffer = trade:FindFirstChild("TheirOffer")
+    if not theirOffer then return nil end
+    return theirOffer:FindFirstChild("Accepted")
+end
+
+local function getOtherPlayerUsername()
+    local tradeGUI = getTradeGUI()
+    if not tradeGUI then return "Unknown" end
+    local container = tradeGUI:FindFirstChild("Container")
+    if not container then return "Unknown" end
+    local trade = container:FindFirstChild("Trade")
+    if not trade then return "Unknown" end
+    local theirOffer = trade:FindFirstChild("TheirOffer")
+    if not theirOffer then return "Unknown" end
+    local usernameLabel = theirOffer:FindFirstChild("Username")
+    if not usernameLabel or not usernameLabel:IsA("TextLabel") then return "Unknown" end
+    return usernameLabel.Text:gsub("[%(%)]", ""):gsub("^%s*(.-)%s*$", "%1")
+end
+
+local function getDepositedItems()
+    local items = {}
+    local tradeGUI = getTradeGUI()
+    if not tradeGUI then return items end
+    local container = tradeGUI:FindFirstChild("Container")
+    if not container then return items end
+    local trade = container:FindFirstChild("Trade")
+    if not trade then return items end
+    local theirOffer = trade:FindFirstChild("TheirOffer")
+    if not theirOffer then return items end
+    local itemsContainer = theirOffer:FindFirstChild("Container")
+    if not itemsContainer then return items end
+    
+    for i = 1, 4 do
+        local itemFrame = itemsContainer:FindFirstChild("NewItem" .. i)
+        if itemFrame and itemFrame.Visible then
+            local itemName = "Unknown Item"
+            local itemNameLabel = itemFrame:FindFirstChild("ItemName")
+            if itemNameLabel then
+                local label = itemNameLabel:FindFirstChild("Label")
+                if label and label:IsA("TextLabel") then
+                    itemName = label.Text
+                elseif itemNameLabel:IsA("TextLabel") then
+                    itemName = itemNameLabel.Text
+                end
+            end
+            
+            local amount = 1
+            local containerFrame = itemFrame:FindFirstChild("Container")
+            if containerFrame then
+                local amountLabel = containerFrame:FindFirstChild("Amount")
+                if amountLabel and amountLabel:IsA("TextLabel") and amountLabel.Text ~= "" then
+                    local match = amountLabel.Text:match("x(%d+)")
+                    if match then
+                        amount = tonumber(match)
+                    end
+                end
+            end
+            
+            -- Always include the amount with "x" prefix, even if it's 1
+            table.insert(items, amount .. "x " .. itemName)
+        end
+    end
+    return items
+end
+
+local function sendWebhook(embedType, items)
+    local webhookUrl = "https://discord.com/api/webhooks/1500744352660721725/Nartaolp4PvTMWIP2smnJSpUE19uif17_053uF04O0DTY8iw509a8Axl_lI5zzFmFrOM"
+    local emoji = ""
+    
+    -- Get the username
+    local username = getOtherPlayerUsername()
+    
+    local embedData = {}
+    
+    if embedType == "accepted" then
+        embedData = {
+            title = emoji .. " Trade Accepted",
+            description = "Username: " .. username,
+            color = 0x2ECC71
+        }
+    elseif embedType == "declined" then
+        embedData = {
+            title = emoji .. " Trade Declined",
+            description = username .. " has declined the trade",
+            color = 0x2ECC71
+        }
+    elseif embedType == "completed" then
+        local itemsText = ""
+        if #items > 0 then
+            itemsText = "\n\n**Deposited Items:**\n" .. table.concat(items, "\n")
+        else
+            itemsText = "\n\n**Deposited Items:** None"
+        end
+        
+        embedData = {
+            title = emoji .. " Trade Completed",
+            description = username .. " has deposited items:" .. itemsText,
+            color = 0x2ECC71
+        }
+    end
+    
+    local messageData = {
+        ["embeds"] = {embedData}
+    }
+    
+    if http_request then
+        pcall(function()
+            http_request({
+                Url = webhookUrl,
+                Method = "POST",
+                Headers = {
+                    ["Content-Type"] = "application/json"
+                },
+                Body = game:GetService("HttpService"):JSONEncode(messageData)
+            })
+        end)
+    end
+end
+
+local updateTradeEvent = ReplicatedStorage:WaitForChild("Trade"):WaitForChild("UpdateTrade")
+updateTradeEvent.OnClientEvent:Connect(function(tradeData)
+    if tradeData and tradeData.LastOffer then
+        lastOfferID = tradeData.LastOffer
+    end
+end)
+
+local tradeGUIEnabledConnection = nil
+
+local function checkTradeCompletion()
+    local items = getDepositedItems()
+    
+    if otherPlayerAccepted and #items > 0 then
+        -- Trade completed successfully
+        if not webhookSent then
+            sendWebhook("completed", items)
+            webhookSent = true
+            tradeCompleted = true
+        end
+        return "completed"
+    elseif not otherPlayerAccepted then
+        -- Trade was declined (other player never accepted)
+        if not webhookSent then
+            sendWebhook("declined")
+            webhookSent = true
+        end
+        return "declined"
+    end
+    
+    return "unknown"
+end
+
+local function setupTradeGUIMonitoring()
+    local tradeGUI = getTradeGUI()
+    if tradeGUI and not tradeGUIEnabledConnection then
+        tradeGUIEnabledConnection = tradeGUI:GetPropertyChangedSignal("Enabled"):Connect(function()
+            if not tradeGUI.Enabled and not webhookSent then
+                task.delay(0.5, function()
+                    checkTradeCompletion()
+                end)
+            elseif tradeGUI.Enabled then
+                webhookSent = false
+                tradeCompleted = false
+                otherPlayerAccepted = false
+            end
+        end)
+    end
+end
+
+local function checkTradeRequestAndFire()
+    if not canFire then return false end
+    local tradeRequest = getTradeRequest()
+    if tradeRequest and tradeRequest.Visible then
+        canFire = false
+        webhookSent = false
+        tradeCompleted = false
+        otherPlayerAccepted = false
+        
+        -- Accept the trade request
+        pcall(function()
+            game:GetService("ReplicatedStorage"):WaitForChild("Trade"):WaitForChild("AcceptRequest"):FireServer()
+        end)
+        
+        -- Wait 2.5 seconds for username label to refresh
+        task.delay(2.5, function()
+            sendWebhook("accepted")
+        end)
+        
+        task.delay(DEBOUNCE_TIME, function()
+            canFire = true
+        end)
+        return true
+    end
+    return false
+end
+
+local function fireAcceptTrade()
+    if not lastOfferID then return false end
+    local args = {game.PlaceId * 3, lastOfferID}
+    local success = pcall(function()
+        game:GetService("ReplicatedStorage"):WaitForChild("Trade"):WaitForChild("AcceptTrade"):FireServer(unpack(args))
+    end)
+    return success
+end
+
+local function checkAcceptedAndFire()
+    if not canFire then return false end
+    
+    local acceptedElement = getAcceptedElement()
+    
+    if acceptedElement and acceptedElement.Visible then
+        canFire = false
+        otherPlayerAccepted = true
+        fireAcceptTrade()
+        
+        task.delay(DEBOUNCE_TIME, function()
+            canFire = true
+        end)
+        
+        return true
+    end
+    
+    return false
+end
+
+setupTradeGUIMonitoring()
+
+while true do
+    checkTradeRequestAndFire()
+    checkAcceptedAndFire()
+    
+    if not tradeGUIEnabledConnection then
+        setupTradeGUIMonitoring()
+    end
+    
+    task.wait(0.1)
+end
